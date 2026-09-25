@@ -47,6 +47,7 @@ static Node *new_node(const char *name, Node *parent, const struct stat *st,
     if (!n->name) { free(n); return NULL; }
     n->parent = parent;
     n->is_dir = S_ISDIR(st->st_mode);
+    n->is_regular = S_ISREG(st->st_mode);
     n->is_symlink = S_ISLNK(st->st_mode);
     n->self_size = inode_size(st, options);
     n->size = n->self_size;

@@ -12,6 +12,7 @@ typedef struct Node {
     size_t child_count, child_capacity;
     uint64_t size, self_size;
     unsigned is_dir : 1;
+    unsigned is_regular : 1;
     unsigned is_symlink : 1;
     unsigned is_hardlink_duplicate : 1;
     int x, y, w, h;

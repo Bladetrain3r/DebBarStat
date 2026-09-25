@@ -1,11 +1,14 @@
 #define _POSIX_C_SOURCE 200809L
 #include "scan.h"
+#include "report.h"
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <locale.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,9 +30,12 @@ typedef struct {
     ScanStats stats;
     char *path;
     char progress_path[240];
+    char notice[512];
     Time last_click;
     Node *last_hit;
 } App;
+
+extern char **environ;
 
 static void format_size(uint64_t size, char *out, size_t capacity) {
     static const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
@@ -157,7 +163,7 @@ static void draw(App *app) {
     fill(app, 0, full);
     fill(app, 1, (Rect){0, 0, app->width, TOP});
     label(app, 5, PAD, 25, app->width - 2 * PAD,
-          "DebBarStat  |  A size mode  |  R rescan  |  Backspace back");
+          "DebBarStat  |  A size mode  |  E export  |  Ctrl+click folder");
     if (app->scanning) {
         char info[260];
         snprintf(info, sizeof(info), "Scanning  %" PRIu64 " files  /  %" PRIu64 " directories",
@@ -204,14 +210,18 @@ static void draw(App *app) {
     if (app->selected && app->selected->w > 3 && app->selected->h > 3)
         line(app, 5, app->selected->x, app->selected->y, app->selected->w, app->selected->h);
     fill(app, 1, (Rect){0, app->height - BOTTOM, app->width, BOTTOM});
-    const Node *detail = app->selected ? app->selected : app->focus;
-    char *detail_path = node_path(detail);
-    format_size(detail->size, size, sizeof(size));
-    snprintf(linebuf, sizeof(linebuf), "%s%s  |  %s", size,
-             detail->is_hardlink_duplicate ? " (hard link counted elsewhere)" : "",
-             detail_path ? detail_path : "");
-    label(app, 4, PAD, app->height - 12, app->width - 2 * PAD, linebuf);
-    free(detail_path);
+    if (app->notice[0]) {
+        label(app, 5, PAD, app->height - 12, app->width - 2 * PAD, app->notice);
+    } else {
+        const Node *detail = app->selected ? app->selected : app->focus;
+        char *detail_path = node_path(detail);
+        format_size(detail->size, size, sizeof(size));
+        snprintf(linebuf, sizeof(linebuf), "%s%s  |  %s", size,
+                 detail->is_hardlink_duplicate ? " (hard link counted elsewhere)" : "",
+                 detail_path ? detail_path : "");
+        label(app, 4, PAD, app->height - 12, app->width - 2 * PAD, linebuf);
+        free(detail_path);
+    }
     XFlush(app->display);
 }
 
@@ -297,8 +307,60 @@ static int make_window(App *app) {
     return 0;
 }
 
+static void open_folder(App *app, const Node *node) {
+    const Node *folder = node->is_dir ? node : node->parent;
+    char *path = node_path(folder);
+    if (!path) {
+        snprintf(app->notice, sizeof(app->notice), "Could not build folder path");
+        return;
+    }
+    posix_spawn_file_actions_t actions;
+    int result = posix_spawn_file_actions_init(&actions);
+    if (result == 0) {
+        result = posix_spawn_file_actions_addclose(&actions, ConnectionNumber(app->display));
+        if (result == 0) {
+            char *args[] = {"xdg-open", path, NULL};
+            pid_t child;
+            result = posix_spawnp(&child, "xdg-open", &actions, NULL, args, environ);
+        }
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    if (result == 0)
+        snprintf(app->notice, sizeof(app->notice), "Opening folder: %s", path);
+    else snprintf(app->notice, sizeof(app->notice), "Could not open file manager: %s",
+                  strerror(result));
+    free(path);
+}
+
+static void export_report(App *app) {
+    time_t now = time(NULL);
+    struct tm when;
+    if (now == (time_t)-1 || !localtime_r(&now, &when)) {
+        snprintf(app->notice, sizeof(app->notice), "Could not get report timestamp");
+        return;
+    }
+    char stamp[32];
+    if (!strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &when)) return;
+    for (int suffix = 0; suffix < 1000; suffix++) {
+        char path[96];
+        snprintf(path, sizeof(path), "debbarstat-%s-%03d.csv", stamp, suffix);
+        if (report_export_csv(path, app->root, app->scan_options, &app->stats) == 0) {
+            snprintf(app->notice, sizeof(app->notice), "Saved report in current directory: %s",
+                     path);
+            return;
+        }
+        if (errno != EEXIST) {
+            snprintf(app->notice, sizeof(app->notice), "Report export failed: %s",
+                     strerror(errno));
+            return;
+        }
+    }
+    snprintf(app->notice, sizeof(app->notice), "Report export failed: too many files");
+}
+
 static void handle_key(App *app, XKeyEvent *event) {
     KeySym key = XLookupKeysym(event, 0);
+    app->notice[0] = '\0';
     if (key == XK_q || key == XK_Escape) app->quit = 1;
     else if (key == XK_BackSpace || key == XK_Left) {
         if (app->focus->parent) app->focus = app->focus->parent;
@@ -311,6 +373,8 @@ static void handle_key(App *app, XKeyEvent *event) {
             app->scan_options.apparent_size = !app->scan_options.apparent_size;
             fprintf(stderr, "DebBarStat: size-mode scan failed: %s\n", strerror(errno));
         }
+    } else if (key == XK_e || key == XK_E) {
+        export_report(app);
     } else if ((key == XK_Down || key == XK_Up || key == XK_Home || key == XK_End) &&
                app->focus->child_count) {
         size_t index = app->focus->child_count;
@@ -335,6 +399,7 @@ static void handle_key(App *app, XKeyEvent *event) {
 }
 
 static void handle_button(App *app, XButtonEvent *event) {
+    app->notice[0] = '\0';
     if (event->button == Button3) {
         if (app->focus->parent) app->focus = app->focus->parent;
         app->selected = NULL; app->scroll = 0;
@@ -348,6 +413,7 @@ static void handle_button(App *app, XButtonEvent *event) {
         int index = (event->y - (TOP + 79)) / ROW + app->scroll;
         if (index >= 0 && (size_t)index < app->focus->child_count) {
             Node *n = app->focus->children[index];
+            if (event->state & ControlMask) { open_folder(app, n); return; }
             if (n->is_dir) { app->focus = n; app->selected = NULL; app->scroll = 0; }
             else app->selected = n;
         }
@@ -356,6 +422,7 @@ static void handle_button(App *app, XButtonEvent *event) {
     if (event->button != Button1 || event->x < SIDE || event->y < TOP) return;
     Node *n = hit(app->focus, event->x, event->y);
     if (!n) return;
+    if (event->state & ControlMask) { open_folder(app, n); return; }
     if (n == app->last_hit && event->time - app->last_click < 350) {
         Node *dir = n->is_dir ? n : n->parent;
         if (dir && dir != app->focus) { app->focus = dir; app->scroll = 0; }
@@ -366,35 +433,44 @@ static void handle_button(App *app, XButtonEvent *event) {
 }
 
 static void usage(FILE *out) {
-    fputs("Usage: debbarstat [--all-filesystems] [--apparent-size] [--summary] [PATH]\n"
+    fputs("Usage: debbarstat [--all-filesystems] [--apparent-size] [--summary | --export CSV] [PATH]\n"
           "  PATH defaults to the current directory. Symlinks are never followed.\n"
           "  By default, mounted filesystems beneath PATH are skipped.\n"
           "  Virtual filesystems are always skipped, including /proc and /dev.\n"
           "  Default sizes use allocated blocks and count hard-linked inodes once.\n"
           "  --apparent-size uses logical file sizes; hard links still count once.\n"
           "  --summary prints scan totals without opening a window.\n"
+          "  --export CSV writes a report; use - for standard output.\n"
           "  Mouse: click a file; click a directory in the list to zoom; double-click\n"
-          "         a treemap tile to zoom; right-click to go back; wheel to scroll.\n"
+          "         a treemap tile to zoom; Ctrl+click opens its folder in the file\n"
+          "         manager; right-click goes back; wheel scrolls.\n"
           "  Keys: arrows/Home/End select; Enter opens a directory; Backspace/Left\n"
-          "        go back; A changes size mode; R rescans; Q/Escape quits.\n", out);
+          "        go back; A changes size mode; E exports CSV; R rescans; Q quits.\n", out);
 }
 
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
     int summary = 0;
+    const char *export_path = NULL;
     ScanOptions options = {.same_filesystem = 1};
     const char *path = ".";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
         if (!strcmp(argv[i], "--summary")) { summary = 1; continue; }
+        if (!strcmp(argv[i], "--export")) {
+            if (++i >= argc) { usage(stderr); return 2; }
+            export_path = argv[i];
+            continue;
+        }
         if (!strcmp(argv[i], "--all-filesystems")) { options.same_filesystem = 0; continue; }
         if (!strcmp(argv[i], "--apparent-size")) { options.apparent_size = 1; continue; }
         if (argv[i][0] == '-' && argv[i][1]) { usage(stderr); return 2; }
         path = argv[i];
     }
+    if (summary && export_path) { usage(stderr); return 2; }
     char *canonical = realpath(path, NULL);
     if (!canonical) { fprintf(stderr, "DebBarStat: %s: %s\n", path, strerror(errno)); return 1; }
-    if (summary) {
+    if (summary || export_path) {
         ScanStats stats;
         Node *root = scan_tree(canonical, options, &stats, NULL, NULL);
         if (!root) {
@@ -404,19 +480,32 @@ int main(int argc, char **argv) {
             free(canonical);
             return 1;
         }
-        printf("Path: %s\nBytes: %" PRIu64 "\nFiles: %" PRIu64 "\nDirectories: %" PRIu64
-               "\nSymlinks: %" PRIu64 "\nOther: %" PRIu64 "\nErrors: %" PRIu64
-               "\nHard-link copies: %" PRIu64
-               "\nMounts skipped: %" PRIu64 "\nVirtual filesystems skipped: %" PRIu64
-               "\n", canonical, root->size, stats.files, stats.directories,
-               stats.symlinks, stats.other, stats.errors, stats.hardlink_duplicates,
-               stats.mount_skips,
-               stats.virtual_skips);
+        if (summary) {
+            printf("Path: %s\nBytes: %" PRIu64 "\nFiles: %" PRIu64 "\nDirectories: %" PRIu64
+                   "\nSymlinks: %" PRIu64 "\nOther: %" PRIu64 "\nErrors: %" PRIu64
+                   "\nHard-link copies: %" PRIu64
+                   "\nMounts skipped: %" PRIu64 "\nVirtual filesystems skipped: %" PRIu64
+                   "\n", canonical, root->size, stats.files, stats.directories,
+                   stats.symlinks, stats.other, stats.errors, stats.hardlink_duplicates,
+                   stats.mount_skips, stats.virtual_skips);
+        } else {
+            int result = !strcmp(export_path, "-") ?
+                report_write_csv(stdout, root, options, &stats) :
+                report_export_csv(export_path, root, options, &stats);
+            if (result == 0 && !strcmp(export_path, "-") && fflush(stdout) != 0)
+                result = -1;
+            if (result != 0) {
+                fprintf(stderr, "DebBarStat: report export failed: %s\n", strerror(errno));
+                node_free(root); free(canonical); return 1;
+            }
+            if (strcmp(export_path, "-")) printf("Saved report: %s\n", export_path);
+        }
         node_free(root); free(canonical);
         return stats.errors ? 3 : 0;
     }
     App app = {.path = canonical, .scan_options = options};
     if (make_window(&app) != 0) { free(canonical); return 1; }
+    signal(SIGCHLD, SIG_IGN);
     if (rescan(&app) != 0) {
         if (errno == EOPNOTSUPP)
             fprintf(stderr, "DebBarStat: virtual filesystem excluded: %s\n", canonical);
