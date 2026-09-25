@@ -11,14 +11,36 @@
 #include <sys/vfs.h>
 
 typedef struct {
+    dev_t device;
+    ino_t inode;
+    unsigned used : 1;
+} InodeEntry;
+
+typedef struct {
+    InodeEntry *entries;
+    size_t capacity, count;
+} InodeSet;
+
+typedef struct {
     dev_t root_device;
-    int same_filesystem;
+    ScanOptions options;
+    InodeSet seen;
+    int failed;
     ScanStats *stats;
     ScanProgress progress;
     void *context;
 } Walk;
 
-static Node *new_node(const char *name, Node *parent, const struct stat *st) {
+static uint64_t inode_size(const struct stat *st, ScanOptions options) {
+    if (options.apparent_size)
+        return st->st_size > 0 ? (uint64_t)st->st_size : 0;
+    if (st->st_blocks <= 0) return 0;
+    uint64_t blocks = (uint64_t)st->st_blocks;
+    return blocks > UINT64_MAX / 512 ? UINT64_MAX : blocks * 512;
+}
+
+static Node *new_node(const char *name, Node *parent, const struct stat *st,
+                      ScanOptions options) {
     Node *n = calloc(1, sizeof(*n));
     if (!n) return NULL;
     n->name = strdup(name);
@@ -26,6 +48,8 @@ static Node *new_node(const char *name, Node *parent, const struct stat *st) {
     n->parent = parent;
     n->is_dir = S_ISDIR(st->st_mode);
     n->is_symlink = S_ISLNK(st->st_mode);
+    n->self_size = inode_size(st, options);
+    n->size = n->self_size;
     return n;
 }
 
@@ -56,6 +80,46 @@ static char *join_path(const char *parent, const char *name) {
 
 static uint64_t add_size(uint64_t a, uint64_t b) {
     return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static uint64_t inode_hash(dev_t device, ino_t inode) {
+    uint64_t x = (uint64_t)device ^ ((uint64_t)inode * UINT64_C(0x9e3779b97f4a7c15));
+    x ^= x >> 30; x *= UINT64_C(0xbf58476d1ce4e5b9);
+    x ^= x >> 27; x *= UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+static int inode_set_grow(InodeSet *set) {
+    if (set->capacity > SIZE_MAX / 2) return -1;
+    size_t capacity = set->capacity ? set->capacity * 2 : 1024;
+    InodeEntry *next = calloc(capacity, sizeof(*next));
+    if (!next) return -1;
+    for (size_t i = 0; i < set->capacity; i++) {
+        InodeEntry entry = set->entries[i];
+        if (!entry.used) continue;
+        size_t index = (size_t)inode_hash(entry.device, entry.inode) & (capacity - 1);
+        while (next[index].used) index = (index + 1) & (capacity - 1);
+        next[index] = entry;
+    }
+    free(set->entries);
+    set->entries = next;
+    set->capacity = capacity;
+    return 0;
+}
+
+/* Returns 1 for an already counted inode, 0 for a new one, -1 on OOM. */
+static int inode_seen(InodeSet *set, dev_t device, ino_t inode) {
+    if (!set->capacity || set->count >= set->capacity - set->capacity / 4)
+        if (inode_set_grow(set) != 0) return -1;
+    size_t index = (size_t)inode_hash(device, inode) & (set->capacity - 1);
+    while (set->entries[index].used) {
+        if (set->entries[index].device == device && set->entries[index].inode == inode)
+            return 1;
+        index = (index + 1) & (set->capacity - 1);
+    }
+    set->entries[index] = (InodeEntry){.device = device, .inode = inode, .used = 1};
+    set->count++;
+    return 0;
 }
 
 /* Virtual filesystems describe kernel state, not disk content. In particular,
@@ -107,7 +171,7 @@ static int walk_dir(Node *parent, const char *path, dev_t device,
     if (walk->progress && (walk->stats->directories % 32 == 1))
         walk->progress(walk->stats, path, walk->context);
     struct dirent *ent;
-    while (!walk->stats->cancelled) {
+    while (!walk->stats->cancelled && !walk->failed) {
         errno = 0;
         ent = readdir(dir);
         if (!ent) {
@@ -135,27 +199,34 @@ static int walk_dir(Node *parent, const char *path, dev_t device,
                 free(child_path);
                 continue;
             }
-            if (walk->same_filesystem && st.st_dev != walk->root_device) {
+            if (walk->options.same_filesystem && st.st_dev != walk->root_device) {
                 walk->stats->mount_skips++;
                 free(child_path);
                 continue;
             }
         }
-        Node *child = new_node(ent->d_name, parent, &st);
+        Node *child = new_node(ent->d_name, parent, &st, walk->options);
         if (!child || add_child(parent, child) != 0) {
             node_free(child);
             walk->stats->errors++;
             free(child_path);
             continue;
         }
+        if (!child->is_dir && st.st_nlink > 1) {
+            int seen = inode_seen(&walk->seen, st.st_dev, st.st_ino);
+            if (seen < 0) { walk->failed = 1; free(child_path); break; }
+            if (seen) {
+                child->size = child->self_size = 0;
+                child->is_hardlink_duplicate = 1;
+                walk->stats->hardlink_duplicates++;
+            }
+        }
         if (child->is_dir) {
             walk_dir(child, child_path, st.st_dev, walk, depth + 1);
         } else if (child->is_symlink) {
             walk->stats->symlinks++;
         } else if (S_ISREG(st.st_mode)) {
-            child->size = st.st_size > 0 ? (uint64_t)st.st_size : 0;
             walk->stats->files++;
-            walk->stats->bytes = add_size(walk->stats->bytes, child->size);
         } else {
             walk->stats->other++;
         }
@@ -169,7 +240,7 @@ static int walk_dir(Node *parent, const char *path, dev_t device,
     return 0;
 }
 
-Node *scan_tree(const char *path, int same_filesystem, ScanStats *stats,
+Node *scan_tree(const char *path, ScanOptions options, ScanStats *stats,
                 ScanProgress progress, void *context) {
     if (!path || !stats) { errno = EINVAL; return NULL; }
     memset(stats, 0, sizeof(*stats));
@@ -179,11 +250,14 @@ Node *scan_tree(const char *path, int same_filesystem, ScanStats *stats,
     struct statfs fs;
     if (statfs(path, &fs) != 0) return NULL;
     if (is_virtual_filesystem(fs.f_type)) { errno = EOPNOTSUPP; return NULL; }
-    Node *root = new_node(path, NULL, &st);
+    Node *root = new_node(path, NULL, &st, options);
     if (!root) return NULL;
-    Walk walk = {.root_device = st.st_dev, .same_filesystem = same_filesystem,
+    Walk walk = {.root_device = st.st_dev, .options = options,
                  .stats = stats, .progress = progress, .context = context};
     walk_dir(root, path, st.st_dev, &walk, 0);
+    free(walk.seen.entries);
+    if (walk.failed) { node_free(root); errno = ENOMEM; return NULL; }
+    stats->bytes = root->size;
     node_sort(root);
     return root;
 }

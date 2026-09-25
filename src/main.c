@@ -21,7 +21,8 @@ typedef struct {
     XFontStruct *font;
     Atom close_atom;
     unsigned long colors[16];
-    int width, height, scroll, scanning, quit, same_filesystem;
+    int width, height, scroll, scanning, quit;
+    ScanOptions scan_options;
     Node *root, *focus, *selected;
     ScanStats stats;
     char *path;
@@ -121,7 +122,18 @@ static void layout_node(App *app, Node *node, Rect r, unsigned depth) {
     fill(app, 3, r);
     size_t nonzero = 0;
     while (nonzero < node->child_count && node->children[nonzero]->size) nonzero++;
-    layout_group(app, node->children, 0, nonzero, r, node->size, depth + 1);
+    uint64_t children_size = node->size - node->self_size;
+    Rect children = r;
+    if (node->self_size && children_size) {
+        if (r.w >= r.h) {
+            children.w = (int)((long double)r.w * children_size / node->size);
+            if (children.w < 1) children.w = 1;
+        } else {
+            children.h = (int)((long double)r.h * children_size / node->size);
+            if (children.h < 1) children.h = 1;
+        }
+    }
+    layout_group(app, node->children, 0, nonzero, children, children_size, depth + 1);
     if (r.w > 5 && r.h > 5) line(app, 4, r.x, r.y, r.w, r.h);
 }
 
@@ -144,7 +156,8 @@ static void draw(App *app) {
     Rect full = {0, 0, app->width, app->height};
     fill(app, 0, full);
     fill(app, 1, (Rect){0, 0, app->width, TOP});
-    label(app, 5, PAD, 25, app->width - 2 * PAD, "DebBarStat");
+    label(app, 5, PAD, 25, app->width - 2 * PAD,
+          "DebBarStat  |  A size mode  |  R rescan  |  Backspace back");
     if (app->scanning) {
         char info[260];
         snprintf(info, sizeof(info), "Scanning  %" PRIu64 " files  /  %" PRIu64 " directories",
@@ -161,11 +174,12 @@ static void draw(App *app) {
     fill(app, 1, (Rect){0, TOP, SIDE, app->height - TOP - BOTTOM});
     char size[64], linebuf[512];
     format_size(app->focus->size, size, sizeof(size));
-    snprintf(linebuf, sizeof(linebuf), "Total: %s", size);
+    snprintf(linebuf, sizeof(linebuf), "%s: %s",
+             app->scan_options.apparent_size ? "Apparent" : "Allocated", size);
     label(app, 5, PAD, TOP + 25, SIDE - 2 * PAD, linebuf);
     snprintf(linebuf, sizeof(linebuf), "%" PRIu64 " files / %" PRIu64
-             " dirs / %" PRIu64 " virtual skipped", app->stats.files,
-             app->stats.directories, app->stats.virtual_skips);
+             " dirs / %" PRIu64 " linked copies", app->stats.files,
+             app->stats.directories, app->stats.hardlink_duplicates);
     label(app, 4, PAD, TOP + 48, SIDE - 2 * PAD, linebuf);
     label(app, 4, PAD, TOP + 71, SIDE - 2 * PAD, "Largest entries");
     int rows = visible_rows(app);
@@ -176,7 +190,8 @@ static void draw(App *app) {
         int y = TOP + 94 + j * ROW;
         if (child == app->selected) fill(app, 3, (Rect){6, y - 15, SIDE - 12, ROW});
         format_size(child->size, size, sizeof(size));
-        snprintf(linebuf, sizeof(linebuf), "%s %s", child->is_dir ? ">" : " ", child->name);
+        snprintf(linebuf, sizeof(linebuf), "%s %s", child->is_dir ? ">" :
+                 child->is_hardlink_duplicate ? "=" : " ", child->name);
         label(app, child->is_dir ? 5 : 4, PAD, y, SIDE - 110, linebuf);
         label(app, 4, SIDE - 99, y, 92, size);
     }
@@ -192,7 +207,9 @@ static void draw(App *app) {
     const Node *detail = app->selected ? app->selected : app->focus;
     char *detail_path = node_path(detail);
     format_size(detail->size, size, sizeof(size));
-    snprintf(linebuf, sizeof(linebuf), "%s  |  %s", size, detail_path ? detail_path : "");
+    snprintf(linebuf, sizeof(linebuf), "%s%s  |  %s", size,
+             detail->is_hardlink_duplicate ? " (hard link counted elsewhere)" : "",
+             detail_path ? detail_path : "");
     label(app, 4, PAD, app->height - 12, app->width - 2 * PAD, linebuf);
     free(detail_path);
     XFlush(app->display);
@@ -232,7 +249,7 @@ static int rescan(App *app) {
     snprintf(app->progress_path, sizeof(app->progress_path), "%s", app->path);
     draw(app);
     ScanStats stats;
-    Node *next = scan_tree(app->path, app->same_filesystem, &stats, progress, app);
+    Node *next = scan_tree(app->path, app->scan_options, &stats, progress, app);
     app->stats = stats;
     app->scanning = 0;
     if (!next) {
@@ -286,10 +303,32 @@ static void handle_key(App *app, XKeyEvent *event) {
     else if (key == XK_BackSpace || key == XK_Left) {
         if (app->focus->parent) app->focus = app->focus->parent;
         app->selected = NULL; app->scroll = 0;
-    } else if (key == XK_r) {
+    } else if (key == XK_r || key == XK_R) {
         if (rescan(app) != 0) fprintf(stderr, "DebBarStat: rescan failed: %s\n", strerror(errno));
-    } else if (key == XK_Down && (size_t)(app->scroll + 1) < app->focus->child_count) app->scroll++;
-    else if (key == XK_Up && app->scroll > 0) app->scroll--;
+    } else if (key == XK_a || key == XK_A) {
+        app->scan_options.apparent_size = !app->scan_options.apparent_size;
+        if (rescan(app) != 0) {
+            app->scan_options.apparent_size = !app->scan_options.apparent_size;
+            fprintf(stderr, "DebBarStat: size-mode scan failed: %s\n", strerror(errno));
+        }
+    } else if ((key == XK_Down || key == XK_Up || key == XK_Home || key == XK_End) &&
+               app->focus->child_count) {
+        size_t index = app->focus->child_count;
+        for (size_t i = 0; i < app->focus->child_count; i++)
+            if (app->focus->children[i] == app->selected) { index = i; break; }
+        if (key == XK_Home) index = 0;
+        else if (key == XK_End) index = app->focus->child_count - 1;
+        else if (key == XK_Down) {
+            if (index >= app->focus->child_count) index = 0;
+            else if (index + 1 < app->focus->child_count) index++;
+        } else if (index >= app->focus->child_count) index = 0;
+        else if (index > 0) index--;
+        app->selected = app->focus->children[index];
+        int rows = visible_rows(app);
+        if ((int)index < app->scroll) app->scroll = (int)index;
+        else if (rows > 0 && (int)index >= app->scroll + rows)
+            app->scroll = (int)index - rows + 1;
+    }
     else if (key == XK_Return && app->selected && app->selected->is_dir) {
         app->focus = app->selected; app->selected = NULL; app->scroll = 0;
     }
@@ -327,24 +366,29 @@ static void handle_button(App *app, XButtonEvent *event) {
 }
 
 static void usage(FILE *out) {
-    fputs("Usage: debbarstat [--all-filesystems] [--summary] [PATH]\n"
+    fputs("Usage: debbarstat [--all-filesystems] [--apparent-size] [--summary] [PATH]\n"
           "  PATH defaults to the current directory. Symlinks are never followed.\n"
           "  By default, mounted filesystems beneath PATH are skipped.\n"
           "  Virtual filesystems are always skipped, including /proc and /dev.\n"
+          "  Default sizes use allocated blocks and count hard-linked inodes once.\n"
+          "  --apparent-size uses logical file sizes; hard links still count once.\n"
           "  --summary prints scan totals without opening a window.\n"
           "  Mouse: click a file; click a directory in the list to zoom; double-click\n"
           "         a treemap tile to zoom; right-click to go back; wheel to scroll.\n"
-          "  Keys: Backspace/Left go back; R rescans; Q/Escape quits.\n", out);
+          "  Keys: arrows/Home/End select; Enter opens a directory; Backspace/Left\n"
+          "        go back; A changes size mode; R rescans; Q/Escape quits.\n", out);
 }
 
 int main(int argc, char **argv) {
     setlocale(LC_ALL, "");
-    int summary = 0, same_filesystem = 1;
+    int summary = 0;
+    ScanOptions options = {.same_filesystem = 1};
     const char *path = ".";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
         if (!strcmp(argv[i], "--summary")) { summary = 1; continue; }
-        if (!strcmp(argv[i], "--all-filesystems")) { same_filesystem = 0; continue; }
+        if (!strcmp(argv[i], "--all-filesystems")) { options.same_filesystem = 0; continue; }
+        if (!strcmp(argv[i], "--apparent-size")) { options.apparent_size = 1; continue; }
         if (argv[i][0] == '-' && argv[i][1]) { usage(stderr); return 2; }
         path = argv[i];
     }
@@ -352,7 +396,7 @@ int main(int argc, char **argv) {
     if (!canonical) { fprintf(stderr, "DebBarStat: %s: %s\n", path, strerror(errno)); return 1; }
     if (summary) {
         ScanStats stats;
-        Node *root = scan_tree(canonical, same_filesystem, &stats, NULL, NULL);
+        Node *root = scan_tree(canonical, options, &stats, NULL, NULL);
         if (!root) {
             if (errno == EOPNOTSUPP)
                 fprintf(stderr, "DebBarStat: virtual filesystem excluded: %s\n", canonical);
@@ -362,14 +406,16 @@ int main(int argc, char **argv) {
         }
         printf("Path: %s\nBytes: %" PRIu64 "\nFiles: %" PRIu64 "\nDirectories: %" PRIu64
                "\nSymlinks: %" PRIu64 "\nOther: %" PRIu64 "\nErrors: %" PRIu64
+               "\nHard-link copies: %" PRIu64
                "\nMounts skipped: %" PRIu64 "\nVirtual filesystems skipped: %" PRIu64
                "\n", canonical, root->size, stats.files, stats.directories,
-               stats.symlinks, stats.other, stats.errors, stats.mount_skips,
+               stats.symlinks, stats.other, stats.errors, stats.hardlink_duplicates,
+               stats.mount_skips,
                stats.virtual_skips);
         node_free(root); free(canonical);
         return stats.errors ? 3 : 0;
     }
-    App app = {.path = canonical, .same_filesystem = same_filesystem};
+    App app = {.path = canonical, .scan_options = options};
     if (make_window(&app) != 0) { free(canonical); return 1; }
     if (rescan(&app) != 0) {
         if (errno == EOPNOTSUPP)
