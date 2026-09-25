@@ -1,6 +1,6 @@
 CC ?= cc
 CFLAGS ?= -O2 -g -Wall -Wextra -Wpedantic -std=c11
-CPPFLAGS ?= -D_DEFAULT_SOURCE
+CPPFLAGS ?= -D_DEFAULT_SOURCE -D_FILE_OFFSET_BITS=64
 LDFLAGS ?=
 LDLIBS = -lX11
 

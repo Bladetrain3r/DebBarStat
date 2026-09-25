@@ -60,6 +60,7 @@ static void check_mode(const char *dir, int apparent) {
 }
 
 int main(void) {
+    assert(sizeof(off_t) >= 8);
     char dir[] = "./build/debbarstat-test-XXXXXX";
     assert(mkdtemp(dir));
     char path[512], source[512];
@@ -75,7 +76,9 @@ int main(void) {
     assert(symlink(".", path) == 0);
     snprintf(path, sizeof(path), "%s/sparse.bin", dir);
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    assert(fd >= 0 && ftruncate(fd, 16 * 1024 * 1024) == 0 && close(fd) == 0);
+    assert(fd >= 0);
+    assert(ftruncate(fd, (off_t)(UINT64_C(5) * 1024 * 1024 * 1024)) == 0);
+    assert(close(fd) == 0);
 
     check_mode(dir, 0);
     check_mode(dir, 1);

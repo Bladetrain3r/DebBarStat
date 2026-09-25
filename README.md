@@ -19,6 +19,16 @@ Debian's standard X11 client library (`libX11.so.6`) and glibc; an X server or
 Xwayland display is needed to open the window. It is built for the architecture
 of the build host. Run `ldd dist/debbarstat` to inspect runtime libraries.
 
+The GitHub Actions workflow is configured to build and test Debian `amd64`,
+`arm64` (native runner), and `armhf`/ARMv7 (emulated runner). Each job produces
+an architecture-labeled tarball with the executable, README, and license. To
+reproduce an ARM build on another Docker host, set
+`DEBBARSTAT_PLATFORM=linux/arm64` or
+`DEBBARSTAT_PLATFORM=linux/arm/v7` before running the build script. Running a
+foreign architecture container requires that host to have QEMU/binfmt support.
+These are Debian/glibc binaries, suitable for a Raspberry Pi running a matching
+Debian-based userspace and X display.
+
 For a local development build, install `build-essential`, `libx11-dev`, `xvfb`
 and `xauth`, then run `make check` or `make release`.
 

@@ -1,0 +1,54 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Debian ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+          - arch: armhf
+            runner: ubuntu-24.04
+            platform: linux/arm/v7
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Enable ARM emulation
+        if: matrix.arch == 'armhf'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+      - name: Build and test in Debian Bookworm
+        env:
+          DEBBARSTAT_PLATFORM: ${{ matrix.platform }}
+        run: ./scripts/container-build.sh
+      - name: Package binary
+        run: |
+          tar -czf "dist/debbarstat-linux-${{ matrix.arch }}.tar.gz" \
+            -C dist debbarstat -C "$PWD" README.md LICENSE
+          (cd dist && sha256sum "debbarstat-linux-${{ matrix.arch }}.tar.gz" \
+            > "debbarstat-linux-${{ matrix.arch }}.tar.gz.sha256")
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: debbarstat-linux-${{ matrix.arch }}
+          path: |
+            dist/debbarstat-linux-${{ matrix.arch }}.tar.gz
+            dist/debbarstat-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
