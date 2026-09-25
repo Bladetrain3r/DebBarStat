@@ -1,10 +1,11 @@
 # DebBarStat
 
+![Screenshot](Screenshot.png)
+
 DebBarStat is a small Debian disk visualizer inspired by WinDirStat. It scans a
 directory and shows a size-sorted entry list beside a colored treemap. This is an
 independent implementation under the MIT license.
 
-[Screenshot.png]
 
 ## Build and run
 
