@@ -28,6 +28,11 @@ int main(int argc, char **argv) {
     }
     if (target == None) { fprintf(stderr, "DebBarStat window not found\n"); return 1; }
     nanosleep(&pause, NULL);
+    if (argc > 1 && !strcmp(argv[1], "resize")) {
+        for (int i = 0; i < 120; i++)
+            XResizeWindow(display, target, 900 + i, 600 + i);
+        XSync(display, False);
+    }
     XEvent event = {0};
     int sent;
     if (argc > 1 && !strcmp(argv[1], "export")) {

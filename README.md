@@ -57,7 +57,8 @@ between allocated and apparent sizes and rescans; R rescans; Q/Escape quits.
 Ctrl+click a directory to open it in your file manager, or Ctrl+click a file
 to open its containing folder. This uses `xdg-open` from your desktop session.
 Press E to save a timestamped CSV report of the full scan in the current working
-directory. Tile colors group filenames by extension hash.
+directory. Tile colors group filenames by extension hash. During a window resize,
+the treemap repaints after the drag pauses briefly.
 
 ## Current scope
 

@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <locale.h>
+#include <poll.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -33,6 +34,8 @@ typedef struct {
     char notice[512];
     Time last_click;
     Node *last_hit;
+    unsigned layout_generation;
+    int64_t last_progress_draw_ms;
 } App;
 
 extern char **environ;
@@ -82,9 +85,10 @@ static unsigned hash_type(const Node *node) {
     return 6 + h % 8;
 }
 
-static void clear_rects(Node *n) {
-    n->w = n->h = 0;
-    for (size_t i = 0; i < n->child_count; i++) clear_rects(n->children[i]);
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
 static void layout_node(App *app, Node *node, Rect r, unsigned depth);
@@ -93,6 +97,8 @@ static void layout_group(App *app, Node **items, size_t lo, size_t hi, Rect r,
                          uint64_t total, unsigned depth) {
     if (lo >= hi || r.w < 1 || r.h < 1 || total == 0) return;
     if (hi - lo == 1) { layout_node(app, items[lo], r, depth); return; }
+    /* Tiny groups cannot show useful detail and can contain thousands of nodes. */
+    if ((int64_t)r.w * r.h <= 16) { fill(app, hash_type(items[lo]), r); return; }
     uint64_t half = total / 2, left = 0;
     size_t mid = lo;
     while (mid + 1 < hi && (left < half || mid == lo)) {
@@ -119,9 +125,11 @@ static void layout_group(App *app, Node **items, size_t lo, size_t hi, Rect r,
 
 static void layout_node(App *app, Node *node, Rect r, unsigned depth) {
     node->x = r.x; node->y = r.y; node->w = r.w; node->h = r.h;
+    node->layout_generation = app->layout_generation;
     if (r.w < 1 || r.h < 1) return;
-    if (!node->is_dir || node->child_count == 0 || depth > 1000) {
-        fill(app, hash_type(node), r);
+    if (!node->is_dir || node->child_count == 0 || depth > 1000 ||
+        (int64_t)r.w * r.h <= 16) {
+        fill(app, node->is_dir ? 3 : hash_type(node), r);
         if (r.w > 4 && r.h > 4) line(app, 2, r.x, r.y, r.w, r.h);
         return;
     }
@@ -143,11 +151,12 @@ static void layout_node(App *app, Node *node, Rect r, unsigned depth) {
     if (r.w > 5 && r.h > 5) line(app, 4, r.x, r.y, r.w, r.h);
 }
 
-static Node *hit(Node *node, int x, int y) {
-    if (!node || x < node->x || y < node->y || x >= node->x + node->w ||
+static Node *hit(Node *node, int x, int y, unsigned generation) {
+    if (!node || node->layout_generation != generation ||
+        x < node->x || y < node->y || x >= node->x + node->w ||
         y >= node->y + node->h || node->w <= 0 || node->h <= 0) return NULL;
     for (size_t i = 0; i < node->child_count; i++) {
-        Node *found = hit(node->children[i], x, y);
+        Node *found = hit(node->children[i], x, y, generation);
         if (found) return found;
     }
     return node;
@@ -204,10 +213,12 @@ static void draw(App *app) {
     Rect map = {SIDE + 6, TOP + 6, app->width - SIDE - 12,
                 app->height - TOP - BOTTOM - 12};
     fill(app, 3, map);
-    clear_rects(app->focus);
+    app->layout_generation++;
+    if (app->layout_generation == 0) app->layout_generation++;
     if (app->focus->size && map.w > 0 && map.h > 0) layout_node(app, app->focus, map, 0);
     else label(app, 4, map.x + 12, map.y + 24, map.w - 24, "No nonempty files");
-    if (app->selected && app->selected->w > 3 && app->selected->h > 3)
+    if (app->selected && app->selected->layout_generation == app->layout_generation &&
+        app->selected->w > 3 && app->selected->h > 3)
         line(app, 5, app->selected->x, app->selected->y, app->selected->w, app->selected->h);
     fill(app, 1, (Rect){0, app->height - BOTTOM, app->width, BOTTOM});
     if (app->notice[0]) {
@@ -245,12 +256,17 @@ static void progress(ScanStats *stats, const char *path, void *context) {
         }
     }
     if (app->quit) stats->cancelled = 1;
-    draw(app);
+    int64_t now = monotonic_ms();
+    if (now - app->last_progress_draw_ms >= 120) {
+        draw(app);
+        app->last_progress_draw_ms = now;
+    }
 }
 
 static int rescan(App *app) {
     Node *previous_focus = app->focus;
     Node *previous_selection = app->selected;
+    ScanStats previous_stats = app->stats;
     int previous_scroll = app->scroll;
     app->scanning = 1;
     app->selected = app->focus = NULL;
@@ -258,6 +274,7 @@ static int rescan(App *app) {
     app->last_hit = NULL;
     snprintf(app->progress_path, sizeof(app->progress_path), "%s", app->path);
     draw(app);
+    app->last_progress_draw_ms = monotonic_ms();
     ScanStats stats;
     Node *next = scan_tree(app->path, app->scan_options, &stats, progress, app);
     app->stats = stats;
@@ -265,13 +282,12 @@ static int rescan(App *app) {
     if (!next) {
         app->focus = previous_focus;
         app->selected = previous_selection;
+        app->stats = previous_stats;
         app->scroll = previous_scroll;
-        draw(app);
         return -1;
     }
     node_free(app->root);
     app->root = app->focus = next;
-    draw(app);
     return 0;
 }
 
@@ -358,25 +374,39 @@ static void export_report(App *app) {
     snprintf(app->notice, sizeof(app->notice), "Report export failed: too many files");
 }
 
-static void handle_key(App *app, XKeyEvent *event) {
+static int handle_key(App *app, XKeyEvent *event) {
     KeySym key = XLookupKeysym(event, 0);
-    app->notice[0] = '\0';
-    if (key == XK_q || key == XK_Escape) app->quit = 1;
-    else if (key == XK_BackSpace || key == XK_Left) {
+    if (key == XK_q || key == XK_Escape) { app->quit = 1; return 0; }
+    if (key == XK_BackSpace || key == XK_Left) {
+        int changed = app->focus->parent || app->selected || app->scroll || app->notice[0];
         if (app->focus->parent) app->focus = app->focus->parent;
         app->selected = NULL; app->scroll = 0;
-    } else if (key == XK_r || key == XK_R) {
+        app->notice[0] = '\0';
+        return changed;
+    }
+    if (key == XK_r || key == XK_R) {
+        app->notice[0] = '\0';
         if (rescan(app) != 0) fprintf(stderr, "DebBarStat: rescan failed: %s\n", strerror(errno));
-    } else if (key == XK_a || key == XK_A) {
+        return 1;
+    }
+    if (key == XK_a || key == XK_A) {
+        app->notice[0] = '\0';
         app->scan_options.apparent_size = !app->scan_options.apparent_size;
         if (rescan(app) != 0) {
             app->scan_options.apparent_size = !app->scan_options.apparent_size;
             fprintf(stderr, "DebBarStat: size-mode scan failed: %s\n", strerror(errno));
         }
-    } else if (key == XK_e || key == XK_E) {
+        return 1;
+    }
+    if (key == XK_e || key == XK_E) {
         export_report(app);
-    } else if ((key == XK_Down || key == XK_Up || key == XK_Home || key == XK_End) &&
-               app->focus->child_count) {
+        return 1;
+    }
+    if ((key == XK_Down || key == XK_Up || key == XK_Home || key == XK_End) &&
+        app->focus->child_count) {
+        Node *previous = app->selected;
+        int previous_scroll = app->scroll;
+        int had_notice = app->notice[0] != '\0';
         size_t index = app->focus->child_count;
         for (size_t i = 0; i < app->focus->child_count; i++)
             if (app->focus->children[i] == app->selected) { index = i; break; }
@@ -392,44 +422,64 @@ static void handle_key(App *app, XKeyEvent *event) {
         if ((int)index < app->scroll) app->scroll = (int)index;
         else if (rows > 0 && (int)index >= app->scroll + rows)
             app->scroll = (int)index - rows + 1;
+        app->notice[0] = '\0';
+        return previous != app->selected || previous_scroll != app->scroll || had_notice;
     }
-    else if (key == XK_Return && app->selected && app->selected->is_dir) {
+    if (key == XK_Return && app->selected && app->selected->is_dir) {
         app->focus = app->selected; app->selected = NULL; app->scroll = 0;
+        app->notice[0] = '\0';
+        return 1;
     }
+    return 0;
 }
 
-static void handle_button(App *app, XButtonEvent *event) {
-    app->notice[0] = '\0';
+static int handle_button(App *app, XButtonEvent *event) {
     if (event->button == Button3) {
+        int changed = app->focus->parent || app->selected || app->scroll || app->notice[0];
         if (app->focus->parent) app->focus = app->focus->parent;
         app->selected = NULL; app->scroll = 0;
-        return;
+        app->notice[0] = '\0';
+        return changed;
     }
     if (event->x < SIDE && event->y >= TOP + 77) {
-        if (event->button == Button4 && app->scroll > 0) app->scroll--;
-        if (event->button == Button5 && (size_t)(app->scroll + 1) < app->focus->child_count)
-            app->scroll++;
-        if (event->button != Button1) return;
+        if (event->button == Button4 && app->scroll > 0) {
+            app->scroll--; app->notice[0] = '\0'; return 1;
+        }
+        if (event->button == Button5 && (size_t)(app->scroll + 1) < app->focus->child_count) {
+            app->scroll++; app->notice[0] = '\0'; return 1;
+        }
+        if (event->button != Button1) return 0;
         int index = (event->y - (TOP + 79)) / ROW + app->scroll;
         if (index >= 0 && (size_t)index < app->focus->child_count) {
             Node *n = app->focus->children[index];
-            if (event->state & ControlMask) { open_folder(app, n); return; }
+            if (event->state & ControlMask) { open_folder(app, n); return 1; }
             if (n->is_dir) { app->focus = n; app->selected = NULL; app->scroll = 0; }
-            else app->selected = n;
+            else {
+                int changed = app->selected != n || app->notice[0];
+                app->selected = n;
+                app->notice[0] = '\0';
+                return changed;
+            }
+            app->notice[0] = '\0';
+            return 1;
         }
-        return;
+        return 0;
     }
-    if (event->button != Button1 || event->x < SIDE || event->y < TOP) return;
-    Node *n = hit(app->focus, event->x, event->y);
-    if (!n) return;
-    if (event->state & ControlMask) { open_folder(app, n); return; }
+    if (event->button != Button1 || event->x < SIDE || event->y < TOP) return 0;
+    Node *n = hit(app->focus, event->x, event->y, app->layout_generation);
+    if (!n) return 0;
+    if (event->state & ControlMask) { open_folder(app, n); return 1; }
+    int changed = app->selected != n || app->notice[0];
     if (n == app->last_hit && event->time - app->last_click < 350) {
         Node *dir = n->is_dir ? n : n->parent;
-        if (dir && dir != app->focus) { app->focus = dir; app->scroll = 0; }
+        if (dir && dir != app->focus) { app->focus = dir; app->scroll = 0; changed = 1; }
         app->selected = NULL;
+        changed = 1;
     } else app->selected = n;
     app->last_hit = n;
     app->last_click = event->time;
+    app->notice[0] = '\0';
+    return changed;
 }
 
 static void usage(FILE *out) {
@@ -512,18 +562,47 @@ int main(int argc, char **argv) {
         else fprintf(stderr, "DebBarStat: scan failed: %s\n", strerror(errno));
         XCloseDisplay(app.display); free(canonical); return 1;
     }
+    draw(&app);
+    int redraw = 0, resizing = 0;
+    int64_t resize_deadline = 0;
     while (!app.quit) {
-        XEvent event;
-        XNextEvent(app.display, &event);
-        if (event.type == Expose && event.xexpose.count == 0) draw(&app);
-        else if (event.type == ConfigureNotify) {
-            app.width = event.xconfigure.width; app.height = event.xconfigure.height;
+        for (int batch = 0; batch < 256 && XPending(app.display); batch++) {
+            XEvent event;
+            XNextEvent(app.display, &event);
+            if (event.type == Expose) redraw = 1;
+            else if (event.type == ConfigureNotify) {
+                if (app.width != event.xconfigure.width || app.height != event.xconfigure.height) {
+                    app.width = event.xconfigure.width;
+                    app.height = event.xconfigure.height;
+                    redraw = resizing = 1;
+                    /* Paint once when a resize burst settles. */
+                    resize_deadline = monotonic_ms() + 160;
+                }
+            } else if (event.type == KeyPress) {
+                if (handle_key(&app, &event.xkey)) { redraw = 1; resizing = 0; }
+            } else if (event.type == ButtonPress) {
+                if (redraw && resizing) { draw(&app); redraw = resizing = 0; }
+                if (handle_button(&app, &event.xbutton)) { redraw = 1; resizing = 0; }
+            } else if (event.type == ClientMessage &&
+                       (Atom)event.xclient.data.l[0] == app.close_atom) app.quit = 1;
+            else if (event.type == DestroyNotify) app.quit = 1;
+            if (app.quit) break;
+        }
+        if (app.quit) break;
+        int64_t now = monotonic_ms();
+        if (redraw && (!resizing || now >= resize_deadline)) {
             draw(&app);
-        } else if (event.type == KeyPress) { handle_key(&app, &event.xkey); draw(&app); }
-        else if (event.type == ButtonPress) { handle_button(&app, &event.xbutton); draw(&app); }
-        else if (event.type == ClientMessage && (Atom)event.xclient.data.l[0] == app.close_atom)
-            app.quit = 1;
-        else if (event.type == DestroyNotify) app.quit = 1;
+            redraw = resizing = 0;
+            continue;
+        }
+        if (XPending(app.display)) continue;
+        int timeout = resizing ? (int)(resize_deadline - now) : -1;
+        if (timeout < 0 && resizing) timeout = 0;
+        struct pollfd fd = {.fd = ConnectionNumber(app.display), .events = POLLIN};
+        if (poll(&fd, 1, timeout) < 0 && errno != EINTR) {
+            perror("DebBarStat: X event wait failed");
+            break;
+        }
     }
     node_free(app.root);
     XFreeFont(app.display, app.font);

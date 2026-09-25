@@ -15,11 +15,12 @@ run_case() {
     scan_root=$(realpath "$1")
     expected=$(realpath "$2")
     log=$(realpath -m "$3")
+    mode=${4:-click}
     DEBBARSTAT_OPEN_LOG="$log" PATH="$(realpath "$fixture/bin"):$PATH" \
         xvfb-run -a sh -c '
         "$1" "$2" >/dev/null 2>"$3/app.log" &
         app=$!
-        "$4"
+        "$4" "$6"
         count=0
         while test ! -f "$5" && test "$count" -lt 50; do
             sleep 0.1
@@ -29,10 +30,11 @@ run_case() {
         wait "$app" 2>/dev/null || true
         test -f "$5"
     ' sh "$(realpath "$binary")" "$scan_root" "$(realpath "$fixture")" \
-      "$(realpath "$clicker")" "$log"
+      "$(realpath "$clicker")" "$log" "$mode"
     test "$(cat "$log")" = "$expected"
 }
 run_case "$fixture/data" "$fixture/data" "$fixture/open-file.log"
+run_case "$fixture/data" "$fixture/data" "$fixture/open-resize.log" resize
 mkdir "$fixture/foldercase" "$fixture/foldercase/sub"
 printf 'abcdef' > "$fixture/foldercase/sub/file.txt"
 run_case "$fixture/foldercase" "$fixture/foldercase/sub" "$fixture/open-dir.log"

@@ -16,6 +16,7 @@ typedef struct Node {
     unsigned is_symlink : 1;
     unsigned is_hardlink_duplicate : 1;
     int x, y, w, h;
+    unsigned layout_generation;
 } Node;
 
 typedef struct {
