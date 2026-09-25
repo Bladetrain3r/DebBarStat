@@ -31,9 +31,11 @@ debbarstat [--all-filesystems] [--summary] [PATH]
 `PATH` defaults to the current directory. The scan counts logical file bytes.
 Symlinks are shown as zero-size entries and never followed. By default,
 mounted filesystems below the selected directory are skipped; pass
-`--all-filesystems` to include them. Unreadable or vanished entries are skipped
-and counted as errors. `--summary` prints totals without opening a window and
-exits with status 3 when the scan has errors.
+`--all-filesystems` to include other disk filesystems. Kernel and memory backed
+filesystems, including `/proc`, `/sys`, `/dev`, and tmpfs mounts, are always
+skipped. Starting a scan directly on one of them is rejected. Unreadable or
+vanished entries are skipped and counted as errors. `--summary` prints totals
+without opening a window and exits with status 3 when the scan has errors.
 
 Click a directory in the left list to zoom in. Click a treemap tile to select
 it; double-click to zoom into its containing directory. Right-click or press

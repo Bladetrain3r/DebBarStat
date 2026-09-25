@@ -2,6 +2,7 @@
 #include "scan.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +18,7 @@ static void write_file(const char *path, const char *data) {
 }
 
 int main(void) {
-    char dir[] = "/tmp/debbarstat-test-XXXXXX";
+    char dir[] = "./build/debbarstat-test-XXXXXX";
     assert(mkdtemp(dir));
     char path[512];
     snprintf(path, sizeof(path), "%s/sub", dir);
@@ -46,6 +47,10 @@ int main(void) {
     snprintf(path, sizeof(path), "%s/sub/b.bin", dir); assert(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/sub", dir); assert(rmdir(path) == 0);
     assert(rmdir(dir) == 0);
+    assert(scan_tree("/proc", 0, &stats, NULL, NULL) == NULL);
+    assert(errno == EOPNOTSUPP);
+    assert(scan_tree("/dev", 0, &stats, NULL, NULL) == NULL);
+    assert(errno == EOPNOTSUPP);
     puts("scanner tests passed");
     return 0;
 }

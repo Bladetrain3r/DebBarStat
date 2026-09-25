@@ -3,10 +3,12 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <linux/magic.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 
 typedef struct {
     dev_t root_device;
@@ -56,6 +58,33 @@ static uint64_t add_size(uint64_t a, uint64_t b) {
     return UINT64_MAX - a < b ? UINT64_MAX : a + b;
 }
 
+/* Virtual filesystems describe kernel state, not disk content. In particular,
+ * procfs can report enormous synthetic sizes for files such as /proc/kcore. */
+static int is_virtual_filesystem(long type) {
+    switch ((unsigned long)type) {
+        case PROC_SUPER_MAGIC:
+        case SYSFS_MAGIC:
+        case TMPFS_MAGIC:
+        case RAMFS_MAGIC:
+        case DEVPTS_SUPER_MAGIC:
+        case CGROUP_SUPER_MAGIC:
+        case CGROUP2_SUPER_MAGIC:
+        case DEBUGFS_MAGIC:
+        case TRACEFS_MAGIC:
+        case SECURITYFS_MAGIC:
+        case BPF_FS_MAGIC:
+        case HUGETLBFS_MAGIC:
+        case PSTOREFS_MAGIC:
+        case EFIVARFS_MAGIC:
+        case BINFMTFS_MAGIC:
+        case BINDERFS_SUPER_MAGIC:
+        case AUTOFS_SUPER_MAGIC:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 static int cmp_nodes(const void *a, const void *b) {
     const Node *left = *(Node *const *)a, *right = *(Node *const *)b;
     if (left->size != right->size) return left->size > right->size ? -1 : 1;
@@ -69,16 +98,22 @@ void node_sort(Node *node) {
     for (size_t i = 0; i < node->child_count; i++) node_sort(node->children[i]);
 }
 
-static int walk_dir(Node *parent, const char *path, Walk *walk, unsigned depth) {
+static int walk_dir(Node *parent, const char *path, dev_t device,
+                    Walk *walk, unsigned depth) {
     if (depth >= 1024) { walk->stats->errors++; return 0; }
     DIR *dir = opendir(path);
     if (!dir) { walk->stats->errors++; return 0; }
     walk->stats->directories++;
     if (walk->progress && (walk->stats->directories % 32 == 1))
         walk->progress(walk->stats, path, walk->context);
-    errno = 0;
     struct dirent *ent;
-    while (!walk->stats->cancelled && (ent = readdir(dir))) {
+    while (!walk->stats->cancelled) {
+        errno = 0;
+        ent = readdir(dir);
+        if (!ent) {
+            if (errno) walk->stats->errors++;
+            break;
+        }
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
         char *child_path = join_path(path, ent->d_name);
         if (!child_path) { walk->stats->errors++; continue; }
@@ -88,10 +123,23 @@ static int walk_dir(Node *parent, const char *path, Walk *walk, unsigned depth) 
             free(child_path);
             continue;
         }
-        if (walk->same_filesystem && st.st_dev != walk->root_device) {
-            walk->stats->mount_skips++;
-            free(child_path);
-            continue;
+        if (st.st_dev != device) {
+            struct statfs fs;
+            if (statfs(child_path, &fs) != 0) {
+                walk->stats->errors++;
+                free(child_path);
+                continue;
+            }
+            if (is_virtual_filesystem(fs.f_type)) {
+                walk->stats->virtual_skips++;
+                free(child_path);
+                continue;
+            }
+            if (walk->same_filesystem && st.st_dev != walk->root_device) {
+                walk->stats->mount_skips++;
+                free(child_path);
+                continue;
+            }
         }
         Node *child = new_node(ent->d_name, parent, &st);
         if (!child || add_child(parent, child) != 0) {
@@ -101,7 +149,7 @@ static int walk_dir(Node *parent, const char *path, Walk *walk, unsigned depth) 
             continue;
         }
         if (child->is_dir) {
-            walk_dir(child, child_path, walk, depth + 1);
+            walk_dir(child, child_path, st.st_dev, walk, depth + 1);
         } else if (child->is_symlink) {
             walk->stats->symlinks++;
         } else if (S_ISREG(st.st_mode)) {
@@ -116,9 +164,7 @@ static int walk_dir(Node *parent, const char *path, Walk *walk, unsigned depth) 
         if (walk->progress && ((walk->stats->files + walk->stats->symlinks +
                                 walk->stats->other) % 2048 == 0))
             walk->progress(walk->stats, path, walk->context);
-        errno = 0;
     }
-    if (errno) walk->stats->errors++;
     closedir(dir);
     return 0;
 }
@@ -130,11 +176,14 @@ Node *scan_tree(const char *path, int same_filesystem, ScanStats *stats,
     struct stat st;
     if (lstat(path, &st) != 0) return NULL;
     if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return NULL; }
+    struct statfs fs;
+    if (statfs(path, &fs) != 0) return NULL;
+    if (is_virtual_filesystem(fs.f_type)) { errno = EOPNOTSUPP; return NULL; }
     Node *root = new_node(path, NULL, &st);
     if (!root) return NULL;
     Walk walk = {.root_device = st.st_dev, .same_filesystem = same_filesystem,
                  .stats = stats, .progress = progress, .context = context};
-    walk_dir(root, path, &walk, 0);
+    walk_dir(root, path, st.st_dev, &walk, 0);
     node_sort(root);
     return root;
 }

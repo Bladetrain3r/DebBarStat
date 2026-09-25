@@ -163,8 +163,9 @@ static void draw(App *app) {
     format_size(app->focus->size, size, sizeof(size));
     snprintf(linebuf, sizeof(linebuf), "Total: %s", size);
     label(app, 5, PAD, TOP + 25, SIDE - 2 * PAD, linebuf);
-    snprintf(linebuf, sizeof(linebuf), "%" PRIu64 " files  /  %" PRIu64 " dirs",
-             app->stats.files, app->stats.directories);
+    snprintf(linebuf, sizeof(linebuf), "%" PRIu64 " files / %" PRIu64
+             " dirs / %" PRIu64 " virtual skipped", app->stats.files,
+             app->stats.directories, app->stats.virtual_skips);
     label(app, 4, PAD, TOP + 48, SIDE - 2 * PAD, linebuf);
     label(app, 4, PAD, TOP + 71, SIDE - 2 * PAD, "Largest entries");
     int rows = visible_rows(app);
@@ -329,6 +330,7 @@ static void usage(FILE *out) {
     fputs("Usage: debbarstat [--all-filesystems] [--summary] [PATH]\n"
           "  PATH defaults to the current directory. Symlinks are never followed.\n"
           "  By default, mounted filesystems beneath PATH are skipped.\n"
+          "  Virtual filesystems are always skipped, including /proc and /dev.\n"
           "  --summary prints scan totals without opening a window.\n"
           "  Mouse: click a file; click a directory in the list to zoom; double-click\n"
           "         a treemap tile to zoom; right-click to go back; wheel to scroll.\n"
@@ -351,18 +353,28 @@ int main(int argc, char **argv) {
     if (summary) {
         ScanStats stats;
         Node *root = scan_tree(canonical, same_filesystem, &stats, NULL, NULL);
-        if (!root) { fprintf(stderr, "DebBarStat: scan failed: %s\n", strerror(errno)); free(canonical); return 1; }
+        if (!root) {
+            if (errno == EOPNOTSUPP)
+                fprintf(stderr, "DebBarStat: virtual filesystem excluded: %s\n", canonical);
+            else fprintf(stderr, "DebBarStat: scan failed: %s\n", strerror(errno));
+            free(canonical);
+            return 1;
+        }
         printf("Path: %s\nBytes: %" PRIu64 "\nFiles: %" PRIu64 "\nDirectories: %" PRIu64
                "\nSymlinks: %" PRIu64 "\nOther: %" PRIu64 "\nErrors: %" PRIu64
-               "\nMounts skipped: %" PRIu64 "\n", canonical, root->size, stats.files,
-               stats.directories, stats.symlinks, stats.other, stats.errors, stats.mount_skips);
+               "\nMounts skipped: %" PRIu64 "\nVirtual filesystems skipped: %" PRIu64
+               "\n", canonical, root->size, stats.files, stats.directories,
+               stats.symlinks, stats.other, stats.errors, stats.mount_skips,
+               stats.virtual_skips);
         node_free(root); free(canonical);
         return stats.errors ? 3 : 0;
     }
     App app = {.path = canonical, .same_filesystem = same_filesystem};
     if (make_window(&app) != 0) { free(canonical); return 1; }
     if (rescan(&app) != 0) {
-        fprintf(stderr, "DebBarStat: scan failed: %s\n", strerror(errno));
+        if (errno == EOPNOTSUPP)
+            fprintf(stderr, "DebBarStat: virtual filesystem excluded: %s\n", canonical);
+        else fprintf(stderr, "DebBarStat: scan failed: %s\n", strerror(errno));
         XCloseDisplay(app.display); free(canonical); return 1;
     }
     while (!app.quit) {

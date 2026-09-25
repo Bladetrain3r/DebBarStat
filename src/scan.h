@@ -18,7 +18,7 @@ typedef struct Node {
 
 typedef struct {
     uint64_t files, directories, symlinks, errors, other, bytes;
-    uint64_t mount_skips;
+    uint64_t mount_skips, virtual_skips;
     int cancelled;
 } ScanStats;
 

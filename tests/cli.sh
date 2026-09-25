@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 binary=$1
-fixture=$(mktemp -d)
+fixture=$(mktemp -d ./build/debbarstat-cli-XXXXXX)
 trap 'rm -rf "$fixture"' EXIT
 printf '1234' > "$fixture/a"
 summary=$($binary --summary "$fixture")
